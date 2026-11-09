@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use evalexpr::{
-    build_operator_tree, ContextWithMutableVariables, DefaultNumericTypes, HashMapContext,
-    Value as EvalValue,
+    build_operator_tree, ContextWithMutableVariables, DefaultNumericTypes, EvalexprError,
+    HashMapContext, Value as EvalValue,
 };
 use kdtree::distance::squared_euclidean;
 use kdtree::KdTree;
@@ -460,6 +460,62 @@ fn starts_with_ascii_keyword_at(input: &str, start: usize, keyword: &str) -> boo
         .unwrap_or(false);
 
     !prev_is_word && !next_is_word
+}
+
+/// Math functions that evalexpr only provides under its `math::` namespace. Raster Calculator
+/// expressions (and the legacy WhiteboxTools ones they port) call them bare, e.g. `sqrt('dem')`.
+const BARE_MATH_FUNCTIONS: &[&str] = &[
+    "abs", "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "cos", "cosh",
+    "exp", "exp2", "hypot", "ln", "log10", "log2", "pow", "sin", "sinh", "sqrt", "tan", "tanh",
+];
+
+/// Prefixes bare math function calls with `math::` so evalexpr can resolve them.
+fn qualify_math_functions(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut rest = input;
+    let mut prev: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        let preceded_by_word =
+            prev.is_some_and(|p| p.is_ascii_alphanumeric() || p == '_' || p == ':');
+        if !preceded_by_word {
+            if let Some(name) = BARE_MATH_FUNCTIONS.iter().find(|name| {
+                rest.starts_with(*name) && rest[name.len()..].trim_start().starts_with('(')
+            }) {
+                out.push_str("math::");
+                out.push_str(name);
+                rest = &rest[name.len()..];
+                prev = name.chars().last();
+                continue;
+            }
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+        prev = Some(c);
+    }
+    out
+}
+
+/// Errors that mean the expression itself cannot be evaluated (wrong types, unknown names), as
+/// opposed to a value that has no result in one cell. These are reported instead of being written
+/// to every cell as NoData.
+fn expression_error_message(e: &EvalexprError) -> Option<String> {
+    match e {
+        EvalexprError::ExpectedNumber { actual: EvalValue::Boolean(_) } => Some(format!(
+            "{e}; a comparison gives true or false, so use if(condition, 1, 0) to use it in arithmetic"
+        )),
+        EvalexprError::ExpectedNumber { .. }
+        | EvalexprError::ExpectedBoolean { .. }
+        | EvalexprError::ExpectedNumberOrString { .. }
+        | EvalexprError::ExpectedInt { .. }
+        | EvalexprError::ExpectedFloat { .. }
+        | EvalexprError::TypeError { .. }
+        | EvalexprError::WrongTypeCombination { .. }
+        | EvalexprError::VariableIdentifierNotFound(_)
+        | EvalexprError::FunctionIdentifierNotFound(_)
+        | EvalexprError::WrongOperatorArgumentAmount { .. }
+        | EvalexprError::WrongFunctionArgumentAmount { .. } => Some(e.to_string()),
+        _ => None,
+    }
 }
 
 fn eval_value_to_bool(v: EvalValue) -> Result<bool, ToolError> {
@@ -9134,7 +9190,7 @@ impl Tool for RasterCalculatorTool {
 
         let statement_contains_nodata =
             expression.contains("nodata") || expression.contains("null");
-        let normalized = normalize_conditional_expression(&stmt);
+        let normalized = qualify_math_functions(&normalize_conditional_expression(&stmt));
         let expr_tree = build_operator_tree::<DefaultNumericTypes>(&normalized)
             .map_err(|e| ToolError::Validation(format!("invalid expression: {e}")))?;
 
@@ -9162,7 +9218,7 @@ impl Tool for RasterCalculatorTool {
 
         let row_results: Vec<Vec<f64>> = (0..rows)
             .into_par_iter()
-            .map(|row| {
+            .map(|row| -> Result<Vec<f64>, ToolError> {
                 let mut row_context = HashMapContext::new();
                 let _ = row_context.set_value("rows".to_string(), EvalValue::Float(rows as f64));
                 let _ = row_context.set_value("columns".to_string(), EvalValue::Float(cols as f64));
@@ -9233,13 +9289,21 @@ impl Tool for RasterCalculatorTool {
                                 0.0
                             }
                         }
+                        Err(e) => match expression_error_message(&e) {
+                            Some(message) => {
+                                return Err(ToolError::Validation(format!(
+                                    "invalid expression: {message}"
+                                )))
+                            }
+                            None => out_nodata,
+                        },
                         _ => out_nodata,
                     };
                     row_vals.push(out_val);
                 }
-                row_vals
+                Ok(row_vals)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let flat_results: Vec<f64> = row_results
             .into_par_iter()
@@ -9813,5 +9877,138 @@ impl Tool for InversePcaTool {
         let mut outputs = BTreeMap::new();
         outputs.insert("outputs".to_string(), json!(img_locators));
         Ok(ToolRunResult { outputs })
+    }
+}
+
+#[cfg(test)]
+mod raster_calculator_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use wbcore::CapabilityProvider;
+
+    struct AllowAll;
+
+    impl CapabilityProvider for AllowAll {
+        fn has_tool_access(&self, _tool_id: &'static str, _tier: LicenseTier) -> bool {
+            true
+        }
+    }
+
+    struct NoopProgress;
+    impl wbcore::ProgressSink for NoopProgress {}
+
+    fn test_context() -> ToolContext<'static> {
+        static CAPS: AllowAll = AllowAll;
+        static PROGRESS: NoopProgress = NoopProgress;
+        ToolContext {
+            progress: &PROGRESS,
+            capabilities: &CAPS,
+        }
+    }
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(prefix: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "wbtools_oss_calc_{}_{}_{}",
+                prefix,
+                std::process::id(),
+                nanos
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_raster(path: &str, values: [f64; 4]) {
+        let mut r = Raster::new(RasterConfig {
+            cols: 2,
+            rows: 2,
+            bands: 1,
+            x_min: 0.0,
+            y_min: 0.0,
+            cell_size: 1.0,
+            nodata: -9999.0,
+            data_type: DataType::F32,
+            ..Default::default()
+        });
+        r.set(0, 0, 0, values[0]).unwrap();
+        r.set(0, 0, 1, values[1]).unwrap();
+        r.set(0, 1, 0, values[2]).unwrap();
+        r.set(0, 1, 1, values[3]).unwrap();
+        r.write(path, RasterFormat::GeoTiff).unwrap();
+    }
+
+    fn calculate(prefix: &str, expression: &str) -> Result<[f64; 4], ToolError> {
+        let td = TempDirGuard::new(prefix);
+        let input = td.path.join("a.tif");
+        let output = td.path.join("out.tif");
+        write_raster(input.to_str().unwrap(), [1.0, 4.0, 9.0, 16.0]);
+        let mut args = ToolArgs::new();
+        args.insert("expression".to_string(), json!(expression));
+        args.insert("inputs".to_string(), json!([input]));
+        args.insert("output".to_string(), json!(output));
+        RasterCalculatorTool.run(&args, &test_context())?;
+        let out = Raster::read(output.to_str().unwrap()).expect("output raster should be readable");
+        Ok([
+            out.get(0, 0, 0),
+            out.get(0, 0, 1),
+            out.get(0, 1, 0),
+            out.get(0, 1, 1),
+        ])
+    }
+
+    #[test]
+    fn bare_math_functions_resolve_to_the_math_namespace() {
+        assert_eq!(
+            calculate("sqrt", "sqrt('a')").unwrap(),
+            [1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            qualify_math_functions("exp2(value0) + math::ln(value0)"),
+            "math::exp2(value0) + math::ln(value0)"
+        );
+        assert_eq!(
+            qualify_math_functions("value0 + mycos(value0)"),
+            "value0 + mycos(value0)"
+        );
+    }
+
+    #[test]
+    fn comparisons_select_cells_through_if() {
+        assert_eq!(
+            calculate("if", "if('a' >= 5.0, 1.0, 0.0)").unwrap(),
+            [0.0, 0.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn expressions_that_cannot_be_evaluated_are_reported_not_written_as_nodata() {
+        let boolean_arithmetic = calculate("bool", "('a' >= 5.0) * 1.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            boolean_arithmetic.contains("if(condition, 1, 0)"),
+            "{boolean_arithmetic}"
+        );
+        let unknown = calculate("unknown", "nosuchfunction('a')")
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("nosuchfunction"), "{unknown}");
     }
 }
